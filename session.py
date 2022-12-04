@@ -1,12 +1,17 @@
-from datetime import datetime, timedelta
-import json
-import requests
 import random
-from urllib import parse
+import logging
 from functools import wraps
+from string import ascii_letters, digits
+from datetime import datetime, timedelta
+from pkuiaaa import IAAASession
+from urllib import parse
+from requests_toolbelt import MultipartEncoder
+
+from const import URL
+from tools import prettify, format_date
 
 
-class Session(requests.Session):
+class Session(IAAASession):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.headers.update({
@@ -21,6 +26,9 @@ class Session(requests.Session):
             'Pragma': 'no-cache',
             'Connection': 'keep-alive',
         })
+
+    def __del__(self):
+        self.close()
 
     def get(self, url, *args, **kwargs):
         """重写 get 方法，验证状态码，转化为 json"""
@@ -37,35 +45,18 @@ class Session(requests.Session):
 
     def login(self, username: str, password: str) -> bool:
         """登录门户，重定向出入校申请"""
-        # IAAA 登录
-        json = self.post("https://iaaa.pku.edu.cn/iaaa/oauthlogin.do", data={
-            "userName": username,
-            "appid": "portal2017",
-            "password": password,
-            "redirUrl": "https://portal.pku.edu.cn/portal2017/ssoLogin.do",
-            "randCode": "",
-            "smsCode": "",
-            "optCode": "",
-        }).json()
-        assert json['success'], json
-
-        # 门户 token 验证
-        self.get('https://portal.pku.edu.cn/portal2017/ssoLogin.do', params={
-            '_rand': random.random(),
-            'token': json['token']
-        })
+        super().login(username, password, 'portal2017', URL.LOGIN_REDIRECT)
 
         # 学生出入校重定向
-        res = self.get(
-            'https://portal.pku.edu.cn/portal2017/util/appSysRedir.do?appId=stuCampusExEn')
+        res = self.get(URL.STUDENT_EXEN_APP)
         redir = parse.parse_qs(parse.urlparse(res.url).query)
         token = redir['token'][0]
 
         # 登录学生出入校
-        json = self.get('https://simso.pku.edu.cn/ssapi/simsoLogin', params={
+        json = self.get(URL.SIMSO_LOGIN, params={
             'token': token
         }).json()
-        assert json['success']
+        assert json['success'], json
         sid = json['sid']
 
         # 设置请求参数
@@ -77,8 +68,8 @@ class Session(requests.Session):
         return self.login_check()
 
     def login_check(self):
-        json = self.get(
-            'https://simso.pku.edu.cn/ssapi/stuaffair/epiApply/getJrsqxx').json()
+        """检查是否已登录"""
+        json = self.get(URL.LOGIN_CHECK).json()
         return json['success'] and json['row']['sfyxsq'] == 'y'
 
     @wraps('check_login')
@@ -91,74 +82,141 @@ class Session(requests.Session):
 
     @login_check_wrapper
     def status(self):
-        # 获取申请状态
-        json = self.get(
-            'https://simso.pku.edu.cn/ssapi/stuaffair/epiApply/getSqzt').json()
+        """获取申请状态（当前是否可申请）"""
+        json = self.get(URL.REQUEST_STATUS).json()
         assert json['success']
         return json
 
     def get_supplement(self):
-        lxxx = self.status()['row']['lxxx']
-        lxxx.update(dzyx=lxxx['email'], lxdh=lxxx['yddh'])
-        assert all(k in lxxx for k in [
-                   'yddh', 'ssfjh', 'ssl', 'ssyq', 'dzyx', 'lxdh']), '无法获取住宿、联系信息'
-        return lxxx
+        """获取补充信息"""
+        info = self.status()['row']
+        lxxx = info['lxxx']
+        jbxx = info['jbxx']
+        res = {**lxxx, **jbxx, "dzyx": lxxx['email']}
+        del res['email'], res['xh'], res['xm'], res['xslb'], res['xsmc']
+        return res
 
-    def save(self, delta=0, **info):
-        """尝试保存出入校信息"""
-        # supplement info
+    def save_request(self, exen_type='园区往返', start='', end='', track='', places='', description='', delta=0, **supplements):
+        """尝试保存出入校信息
+        `exen_type`: 出入校类型
+        `track`: 出入校出行轨迹
+        `description`: 出入校具体事项
+        `places`: 园区往返地点
+        `start`: 出入校起点（出入校申请）
+        `end`: 出入校终点（出入校申请）
+        `delta`: 申请时间（今天 or 明天）
+        `supplements`: 补充信息如: qdxm, zdxm
+
+        出入校申请填写: `exen_type`, `start`, `end`, `track`, `description`
+        园区往返填写: `places`, `description`
+        """
         template = {
-            "crxrq": (datetime.now() + timedelta(days=delta)).strftime('%Y%m%d'),
-            "sqbh": "",
-            "crxqd": "",
-            "crxzd": "",
-            "qdbc": "",
-            "zdbc": "",
-            "qdxm": "",
-            "zdxm": "",
-            "crxsy": "园区往返",
-            "gjdqm": "156",
-            "ssdm": "",
-            "djsm": "",
-            "xjsm": "",
-            "jd": "",
-            "bcsm": "",
-            "crxxdgj": "",
-            "dfx14qrbz": "y",
-            "sfyxtycj": "",
-            "tjbz": "",
-            "shbz": "",
-            "shyj": "",
-            "fxjwljs": "",
-            "fxzgfxljs": "",
-            "fxqzmj": "",
-            "fxyczz": "",
+            # 公有信息
+            "crxrq": format_date(delta),  # 出入校日期
+            "crxsy": exen_type,          # 出入校事由(园区往返 或 出入校申请中的具体事由)
+            'crxjtsx': description,        # 出入校具体事项
+
+            # 出入校申请
+            "crxqd": start,  # 出入校起点
+            "crxzd": end,   # 出入校终点
+            "crxxdgj": track,  # 出入校行动轨迹
+            "qdxm": "",    # 起点校门
+            "zdxm": "",    # 终点校门
+
+            # 园区往返
+            'yqc': places,  # 园区出
+            'yqr': places,  # 园区入
+
+            # 提交/审核
+            "sqbh": "",  # 申请编号
+            "tjbz": "",  # 提交标志（是否点击提交）
+            "shbz": "",  # 审核标志（是否被审核）
+            "shyj": "",  # 审核意见
+
+            # 班车
+            "qdbc": "",  # 起点班次
+            "zdbc": "",  # 终点班次
+
+            # 位置编码
+            "gjdqm": "156",  # 国家地区码
+            "ssdm": "11",  # 省市代码
+            "djsm": "01",  # 地级市码
+            "xjsm": "08",  # 县级市码
+            "jd": "中关村",  # 街道
+
+            # 返校相关
+            "dfx14qrbz": "y",  # 返校 14 日内保证？
+            "fxjwljs": "",  # 返校xxxx
+            "fxzgfxljs": "",  # 返校xxxx
+            "fxqzmj": "",  # 返校xxxx
+            "fxyczz": "",  # 返校xxxx
+            "djsjbz": "y",  # 抵京时间保证
+            "djrq": "",  # 抵京日期
+
+            # 未知
+            "sfyxtycj": "",  # 是否允许???
+            "bcsm": ""       # ???
         }
         template.update(**self.get_supplement())
-        template.update(info)
+        template.update(supplements)
 
-        assert all(k in template for k in [
-                   'crxjtsx', 'yqc', 'yqr']), '出入校信息不完整'
+        logging.debug(prettify(template))
 
-        json = self.post('https://simso.pku.edu.cn/ssapi/stuaffair/epiApply/saveSqxx',
-                         params={'applyType': 'yqwf'}, json=template).json()
+        if exen_type == '园区往返': params = {'applyType': 'yqwf'}
+        else: params = {}
+        json = self.post(URL.SAVE_REQUEST, params=params, json=template).json()
         assert json['success'], json
+
+        self.sqbh = json['row']  # 申请编号
+
+    def upload_img(self, img, cldms):
+        assert self.sqbh, '请先获取申请编号！'
+        assert cldms in ['bjjkb', 'xcm'], '文件上传类型应当为 bjjkb / xcm'
+
+        boundary = '------WebKitFormBoundary' + \
+            ''.join(random.choices(ascii_letters + digits, k=16))
+
+        fields = {
+            'files': (f'WechatIMG{random.randint(50, 150)}.jpeg', img, 'image/jpeg'),
+            'cldms': cldms,
+            'sqbh': self.sqbh
+        }
+
+        m = MultipartEncoder(fields=fields, boundary=boundary)
+        json = self.post(URL.UPLOAD_IMG, headers={
+                         'Content-Type': m.content_type}, data=m).json()
+
+        assert json['success'], json
+
+    def fake_img(self):
+        self.upload_img(b'empty image', 'xcm')
+        self.upload_img(b'empty image', 'bjjkb')
+
+    def submit(self) -> bool:
+        assert self.sqbh, "请先获取申请编号！"
+        json = self.get(URL.SUBMIT, params={'sqbh': self.sqbh}).json()
+        assert json['success'], json
+
+    def request_list(self) -> list[dict]:
+        json = self.get(URL.QUERY_REQUEST).json()
+        assert json['success']
+
         return json['row']
 
-    def submit(self, row) -> bool:
-        # 提交申请信息
-        json = self.get('https://simso.pku.edu.cn/ssapi/stuaffair/epiApply/submitSqxx', params={
-            'sqbh': row
-        }).json()
-        assert json['success'], json
+    def get_latest(self) -> dict:
+        """获取最近的申请信息"""
+        latest = self.request_list()[0]
 
-    def get_latest(self):
-        # 获取最近的申请信息
-        json = self.get(
-            'https://simso.pku.edu.cn/ssapi/stuaffair/epiApply/getSqxxHis?pageNum=1').json()
-        assert json['success']
-        return json['row'][0]
+        self.sqbh = latest['sqbh']
+        return latest
 
-
-def prettify(data):
-    return json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True)
+    def request_passed(self, delta=1):
+        """申请是否已通过"""
+        date = (datetime.now() + timedelta(days=delta)).strftime('%Y%m%d')
+        for row in self.request_list():
+            if row.get('crxrq', -1) == date and row.get('shbz', -1) == '审核通过':
+                print(f'{date} 申请已通过')
+                return True
+        else:
+            print(f'{date} 申请未通过')
+            return False
